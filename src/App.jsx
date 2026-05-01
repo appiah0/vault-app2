@@ -30,8 +30,22 @@ async function aesDecrypt(b64, key) {
 }
 
 // ─── LocalStorage (salt, verifier, settings only) ─────────────────────────────
-const K_SALT = "pm_salt", K_VERIFY = "pm_verify", K_SETTINGS = "pm_settings";
+const K_SALT = "pm_salt", K_VERIFY = "pm_verify", K_SETTINGS = "pm_settings", K_LOCKOUT = "pm_lockout";
 const SENTINEL = "VAULT_OK_V2";
+
+// ── Lockout helpers ────────────────────────────────────────────────────────
+function setLockout(durationMs) {
+  localStorage.setItem(K_LOCKOUT, JSON.stringify({ until: Date.now() + durationMs }));
+}
+function getLockoutRemaining() {
+  try {
+    const d = JSON.parse(localStorage.getItem(K_LOCKOUT)||"{}");
+    if (!d.until) return 0;
+    const rem = d.until - Date.now();
+    return rem > 0 ? rem : 0;
+  } catch { return 0; }
+}
+function clearLockout() { localStorage.removeItem(K_LOCKOUT); }
 
 function getOrCreateSalt() {
   const s = localStorage.getItem(K_SALT);
@@ -302,6 +316,7 @@ const I = {
   pin:     "M12 2a5 5 0 015 5c0 3.5-5 11-5 11S7 10.5 7 7a5 5 0 015-5z M12 9a2 2 0 100-4 2 2 0 000 4z",
   qr:      "M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h3v3h-3z M17 17h3v3h-3z M17 14h3",
   breach:  "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z M12 8v4 M12 16h.01",
+  archive: "M21 8v13H3V8 M1 3h22v5H1z M10 12h4",
   sort:    "M3 6h18M7 12h10M11 18h4",
   theme:   "M12 3a6 6 0 009 9 9 9 0 11-9-9z",
   exp:     "M8 2v4M16 2v4M3 10h18M5 4h14a2 2 0 012 2v14a2 2 0 01-2 2H5a2 2 0 01-2-2V6a2 2 0 012-2z",
@@ -543,6 +558,23 @@ select.inp{padding-right:15px;appearance:none}
 /* QR */
 .qr-wrap{display:flex;justify-content:center;padding:16px 0}
 
+/* Long-press context menu */
+.ctx-overlay{position:fixed;inset:0;z-index:150;background:rgba(0,0,0,.55);backdrop-filter:blur(3px);animation:fi .15s ease;display:flex;align-items:flex-end;justify-content:center}
+.ctx-sheet{width:100%;max-width:420px;background:var(--s1);border-radius:var(--r) var(--r) 0 0;border:1px solid var(--bd);border-bottom:none;padding:18px;animation:su .22s cubic-bezier(.34,1.56,.64,1)}
+.ctx-title{font-size:13px;color:var(--mu);font-weight:600;margin-bottom:12px;text-align:center}
+.ctx-name{font-size:16px;font-weight:700;text-align:center;margin-bottom:16px}
+.ctx-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.ctx-btn{display:flex;flex-direction:column;align-items:center;gap:6px;padding:12px 6px;background:var(--s2);border:1px solid var(--bd);border-radius:var(--rs);cursor:pointer;transition:all .15s;font-size:11px;font-weight:600;color:var(--mu)}
+.ctx-btn:active{transform:scale(.95)}
+.ctx-btn.danger{color:var(--red);border-color:rgba(239,68,68,.2);background:rgba(239,68,68,.08)}
+.ctx-btn.warn{color:var(--ylw);border-color:rgba(245,158,11,.2);background:rgba(245,158,11,.08)}
+.ctx-btn.success{color:var(--grn);border-color:rgba(34,197,94,.2);background:rgba(34,197,94,.08)}
+.ctx-btn.accent{color:var(--ac2);border-color:rgba(124,58,237,.2);background:rgba(124,58,237,.08)}
+
+/* Archive tab badge */
+.arch-badge{display:inline-flex;align-items:center;justify-content:center;min-width:17px;height:17px;background:var(--mu);border-radius:99px;font-size:10px;font-weight:700;color:#fff;padding:0 4px;margin-left:4px}
+.vitem.archived{opacity:0.6}
+
 ::-webkit-scrollbar{width:3px} ::-webkit-scrollbar-track{background:transparent} ::-webkit-scrollbar-thumb{background:var(--s3);border-radius:99px}
 `;
 
@@ -582,9 +614,12 @@ function Toast({ msg, type="ok" }) {
 }
 
 // ─── PIN pad ──────────────────────────────────────────────────────────────────
-function PinPad({ title, subtitle, onComplete, onCancel, errorMsg }) {
+function PinPad({ title, subtitle, onComplete, onCancel, errorMsg, resetKey=0 }) {
   const [digits, setDigits] = useState([]);
   const PIN_LEN = 6;
+
+  // Auto-clear digits whenever resetKey changes (step changes) or errorMsg appears
+  useEffect(() => { setDigits([]); }, [resetKey, errorMsg]);
 
   function press(d) {
     if (digits.length >= PIN_LEN) return;
@@ -593,8 +628,6 @@ function PinPad({ title, subtitle, onComplete, onCancel, errorMsg }) {
     if (next.length === PIN_LEN) { setTimeout(() => onComplete(next.join("")), 80); }
   }
   function del() { setDigits(d => d.slice(0,-1)); }
-
-  useEffect(() => { if (errorMsg) setDigits([]); }, [errorMsg]);
 
   return (
     <div className="pin-wrap">
@@ -621,16 +654,48 @@ function PinPad({ title, subtitle, onComplete, onCancel, errorMsg }) {
 function AuthScreen({ onAuth, settings }) {
   const isNew  = !localStorage.getItem(K_VERIFY);
   const hasPin = !!settings.pin;
-  const [mode, setMode]   = useState((!isNew && hasPin) ? "pin" : "master");
-  const [pw,   setPw]     = useState("");
-  const [pw2,  setPw2]    = useState("");
-  const [err,  setErr]    = useState("");
-  const [busy, setBusy]   = useState(false);
-  const [pinErr, setPinErr] = useState("");
+  const [mode,      setMode]      = useState((!isNew && hasPin) ? "pin" : "master");
+  const [pw,        setPw]        = useState("");
+  const [pw2,       setPw2]       = useState("");
+  const [err,       setErr]       = useState("");
+  const [busy,      setBusy]      = useState(false);
+  const [pinErr,    setPinErr]    = useState("");
   const [failCount, setFailCount] = useState(0);
+  const [lockedUntil, setLockedUntil] = useState(() => getLockoutRemaining());
   const MAX_FAILS = 5;
+  const lockoutDuration = (settings.lockoutDuration || 5) * 60 * 1000; // default 5 min
+
+  // Countdown ticker for lockout display
+  useEffect(() => {
+    if (lockedUntil <= 0) return;
+    const id = setInterval(() => {
+      const rem = getLockoutRemaining();
+      setLockedUntil(rem);
+      if (rem <= 0) { clearLockout(); clearInterval(id); }
+    }, 1000);
+    return () => clearInterval(id);
+  }, [lockedUntil]);
+
+  function formatLockout(ms) {
+    const s = Math.ceil(ms / 1000);
+    if (s < 60) return `${s}s`;
+    return `${Math.ceil(s/60)}m ${s%60}s`;
+  }
+
+  function handleFailedAttempt() {
+    const f = failCount + 1;
+    setFailCount(f);
+    if (f >= MAX_FAILS && settings.lockoutEnabled !== false) {
+      setLockout(lockoutDuration);
+      setLockedUntil(lockoutDuration);
+      setErr(`Too many attempts. Try again in ${formatLockout(lockoutDuration)}.`);
+    } else {
+      setErr(`Wrong password. ${MAX_FAILS - f} attempt${MAX_FAILS-f===1?"":"s"} left.`);
+    }
+  }
 
   async function submitMaster() {
+    if (lockedUntil > 0) return;
     setErr(""); setBusy(true);
     try {
       const salt = getOrCreateSalt(), key = await deriveKey(pw, salt);
@@ -640,11 +705,8 @@ function AuthScreen({ onAuth, settings }) {
         await saveVerifier(key); await onAuth(key, pw);
       } else {
         const ok = await verifyKey(key);
-        if (!ok) {
-          const f = failCount + 1; setFailCount(f);
-          setErr(f >= MAX_FAILS ? `Vault locked after ${MAX_FAILS} failed attempts. Clear site data to reset.` : `Wrong password. ${MAX_FAILS-f} attempts left.`);
-          setBusy(false); return;
-        }
+        if (!ok) { handleFailedAttempt(); setBusy(false); return; }
+        clearLockout(); setFailCount(0);
         await onAuth(key, pw);
       }
     } catch(e) { setErr("Error: "+e.message); }
@@ -652,31 +714,33 @@ function AuthScreen({ onAuth, settings }) {
   }
 
   async function submitPin(pin) {
+    if (lockedUntil > 0) return;
     if (pin !== settings.pin) {
       const f = failCount + 1; setFailCount(f);
-      setPinErr(f >= MAX_FAILS ? "Too many attempts. Use master password." : `Wrong PIN. ${MAX_FAILS-f} left.`);
+      if (f >= MAX_FAILS && settings.lockoutEnabled !== false) {
+        setLockout(lockoutDuration); setLockedUntil(lockoutDuration);
+        setPinErr(`Too many attempts. Try again in ${formatLockout(lockoutDuration)}.`);
+      } else {
+        setPinErr(`Wrong PIN. ${MAX_FAILS-f} attempt${MAX_FAILS-f===1?"":"s"} left.`);
+      }
       if (f >= MAX_FAILS) setMode("master");
       return;
     }
     setPinErr(""); setBusy(true);
     try {
-      const salt = getOrCreateSalt(), key = await deriveKey(settings.masterPwCache||"", salt);
-      // PIN auth still needs the real key — re-derive from cached encrypted master
-      // We store an encrypted copy of master pw unlockable with PIN
       if (settings.pinKeyEnc) {
         const pinKey = await deriveKey(pin, Uint8Array.from(atob(settings.pinSalt||""), c=>c.charCodeAt(0)));
         const master = await aesDecrypt(settings.pinKeyEnc, pinKey);
+        const salt   = getOrCreateSalt();
         const realKey = await deriveKey(master, salt);
         const ok = await verifyKey(realKey);
-        if (ok) { await onAuth(realKey, master); return; }
+        if (ok) { clearLockout(); setFailCount(0); await onAuth(realKey, master); return; }
       }
-      setPinErr("PIN auth failed. Use master password.");
-      setMode("master");
+      setPinErr("PIN auth failed. Use master password."); setMode("master");
     } catch { setPinErr("PIN auth failed. Use master password."); setMode("master"); }
     setBusy(false);
   }
 
-  // Biometric
   async function tryBiometric() {
     try {
       const cred = await navigator.credentials.get({ publicKey: {
@@ -688,13 +752,26 @@ function AuthScreen({ onAuth, settings }) {
     } catch { setErr("Biometric failed. Enter password."); }
   }
 
+  const isHardLocked = lockedUntil > 0;
+
   return (
     <div className="auth">
-      <div className="auth-logo"><Ic d={I.shield} size={34} color="#fff" sw={2}/></div>
+      <div className="auth-logo"><Ic d={isHardLocked?I.lock:I.shield} size={34} color="#fff" sw={2}/></div>
       <div className="auth-title">Vault</div>
       <div className="auth-sub">{isNew?"Create a master password to protect your vault":mode==="pin"?"Enter your PIN":"Enter master password to unlock"}</div>
 
-      {mode==="pin" && !isNew ? (
+      {isHardLocked ? (
+        <div className="auth-card" style={{textAlign:"center"}}>
+          <div style={{fontSize:40,marginBottom:8}}>🔒</div>
+          <div style={{fontWeight:700,fontSize:17,color:"var(--red)"}}>Vault Locked</div>
+          <div style={{fontSize:14,color:"var(--mu)",marginTop:8,lineHeight:1.6}}>
+            Too many failed attempts.<br/>Try again in <b style={{color:"var(--tx)"}}>{formatLockout(lockedUntil)}</b>
+          </div>
+          <div style={{marginTop:16,height:4,background:"var(--s3)",borderRadius:99,overflow:"hidden"}}>
+            <div style={{height:"100%",background:"var(--red)",borderRadius:99,transition:"width 1s linear",width:(lockedUntil/lockoutDuration*100)+"%"}}/>
+          </div>
+        </div>
+      ) : mode==="pin" && !isNew ? (
         <div className="auth-card">
           <PinPad title="" subtitle="" onComplete={submitPin} onCancel={()=>setMode("master")} errorMsg={pinErr}/>
           {settings.biometric && <button className="btn btn-g" style={{marginTop:10}} onClick={tryBiometric}>
@@ -708,7 +785,7 @@ function AuthScreen({ onAuth, settings }) {
           {isNew && <div className="ig"><label className="lbl">Confirm Password</label>
             <PwInp value={pw2} onChange={setPw2} placeholder="Confirm password"/></div>}
           {err && <div className="err">{err}</div>}
-          <button className="btn btn-p" style={{marginTop:16}} onClick={submitMaster} disabled={busy||failCount>=MAX_FAILS}>
+          <button className="btn btn-p" style={{marginTop:16}} onClick={submitMaster} disabled={busy}>
             {busy?"Working…":isNew?"Create Vault":"Unlock Vault"}
           </button>
           {!isNew && settings.biometric && (
@@ -1023,11 +1100,20 @@ function SettingsScreen({ vault, settings, onSettings, onImport, toast, onLogout
   }
 
   const autoLockOptions = [
-    { v:0,  label:"Never" },
-    { v:60, label:"1 minute" },
-    { v:300,label:"5 minutes" },
-    { v:600,label:"10 minutes" },
-    { v:1800,label:"30 minutes" },
+    { v:0,    label:"Never" },
+    { v:15,   label:"15 seconds" },
+    { v:30,   label:"30 seconds" },
+    { v:60,   label:"1 minute" },
+    { v:300,  label:"5 minutes" },
+    { v:600,  label:"10 minutes" },
+    { v:1800, label:"30 minutes" },
+    { v:3600, label:"1 hour" },
+  ];
+  const lockoutOptions = [
+    { v:5,   label:"5 minutes" },
+    { v:15,  label:"15 minutes" },
+    { v:30,  label:"30 minutes" },
+    { v:60,  label:"1 hour" },
   ];
 
   return (
@@ -1050,6 +1136,23 @@ function SettingsScreen({ vault, settings, onSettings, onImport, toast, onLogout
           {autoLockOptions.map(o=><option key={o.v} value={o.v}>{o.label}</option>)}
         </select>
       </div>
+      <div className="sitem sitem-nc">
+        <div className="sicobox" style={{background:"rgba(239,68,68,.1)"}}><Ic d={I.lock} size={20} color="var(--red)"/></div>
+        <div style={{flex:1}}>
+          <div className="slabel">Failed Login Lockout</div>
+          <div className="ssub">Lock vault for set time after 5 wrong attempts</div>
+        </div>
+        <Toggle on={settings.lockoutEnabled!==false} onChange={v=>onSettings({...settings,lockoutEnabled:v})}/>
+      </div>
+      {settings.lockoutEnabled!==false && (
+        <div className="sitem sitem-nc" style={{paddingLeft:20}}>
+          <div style={{flex:1}}><div className="slabel" style={{fontSize:14}}>Lockout Duration</div><div className="ssub">How long to lock after 5 failures</div></div>
+          <select className="inp" style={{width:"auto",padding:"6px 10px",fontSize:13,background:"var(--s2)"}}
+            value={settings.lockoutDuration||5} onChange={e=>onSettings({...settings,lockoutDuration:Number(e.target.value)})}>
+            {lockoutOptions.map(o=><option key={o.v} value={o.v}>{o.label}</option>)}
+          </select>
+        </div>
+      )}
       <div className="sitem" onClick={()=>{setShowPin(true);setPinStep("set");setPinFirst("");setPinErr("");}}>
         <div className="sicobox" style={{background:"rgba(124,58,237,.12)"}}><Ic d={I.pin} size={20} color="var(--ac2)"/></div>
         <div style={{flex:1}}>
@@ -1103,6 +1206,8 @@ function SettingsScreen({ vault, settings, onSettings, onImport, toast, onLogout
             </div>
             <div className="mbdy">
               <PinPad
+                key={pinStep}
+                resetKey={pinStep==="confirm"?1:0}
                 title={pinStep==="set"?"Choose a 6-digit PIN":"Confirm your PIN"}
                 subtitle={pinStep==="set"?"You'll use this to unlock quickly":"Enter the same PIN again"}
                 onComplete={handleSetPin}
@@ -1374,11 +1479,37 @@ function ItemDetail({ item, onEdit, onDelete, onClose, cryptoKey }) {
 }
 
 // ─── Vault list item component ────────────────────────────────────────────────
-function VaultItem({ item, onClick }) {
+function VaultItem({ item, onClick, onLongPress }) {
   const col     = catColor(item.category);
   const expired = item.expiresAt && Date.now() > item.expiresAt;
+  const pressTimer = useRef();
+  const didLongPress = useRef(false);
+
+  function startPress() {
+    didLongPress.current = false;
+    pressTimer.current = setTimeout(() => {
+      didLongPress.current = true;
+      onLongPress?.();
+    }, 500);
+  }
+  function endPress(e) {
+    clearTimeout(pressTimer.current);
+    if (didLongPress.current) { e.preventDefault(); return; }
+  }
+  function handleClick() {
+    if (!didLongPress.current) onClick();
+  }
+
   return (
-    <div className="vitem" onClick={onClick}>
+    <div
+      className={"vitem"+(item.archived?" archived":"")}
+      onClick={handleClick}
+      onMouseDown={startPress}
+      onMouseUp={endPress}
+      onTouchStart={startPress}
+      onTouchEnd={endPress}
+      onContextMenu={e=>{e.preventDefault();onLongPress?.();}}
+    >
       <div style={{position:"absolute",left:0,top:0,bottom:0,width:3,background:col,borderRadius:"99px 0 0 99px"}}/>
       <div className="vico" style={{background:col+"22"}}>
         {item.images?.[0]?<img src={item.images[0]} alt=""/>:<Ic d={catIcon(item.category)} size={19} color={col}/>}
@@ -1386,6 +1517,7 @@ function VaultItem({ item, onClick }) {
       <div className="vinf">
         <div className="vname">{item.name}
           {item.favourite && <Ic d={I.star} size={12} color="#f59e0b" style={{fill:"#f59e0b",marginLeft:5,verticalAlign:"middle"}}/>}
+          {item.archived && <span style={{fontSize:10,color:"var(--mu)",marginLeft:5,verticalAlign:"middle"}}>archived</span>}
         </div>
         <div className="vsub">{item.username||item.url||catLabel(item.category)}</div>
         {(item.tags||[]).length>0 && <div className="vtags">{item.tags.slice(0,3).map(t=><span key={t} className="vtag">#{t}</span>)}</div>}
@@ -1394,6 +1526,35 @@ function VaultItem({ item, onClick }) {
         {item.totpSecret && <span className="vbadge" style={{background:"rgba(124,58,237,.15)",color:"var(--ac2)"}}>2FA</span>}
         {expired && <span className="vbadge" style={{background:"rgba(239,68,68,.1)",color:"var(--red)"}}>Expired</span>}
         <Ic d={I.arr} size={16} color="var(--mu)"/>
+      </div>
+    </div>
+  );
+}
+
+// ─── Context Menu (long press actions) ───────────────────────────────────────
+function ContextMenu({ item, onClose, onDelete, onToggleFav, onToggleArchive, onEdit }) {
+  return (
+    <div className="ctx-overlay" onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div className="ctx-sheet">
+        <div className="ctx-title">Quick Actions</div>
+        <div className="ctx-name">{item.name}</div>
+        <div className="ctx-grid">
+          <div className="ctx-btn accent" onClick={()=>{onEdit();onClose();}}>
+            <Ic d={I.edit} size={22} color="var(--ac2)"/>Edit
+          </div>
+          <div className={"ctx-btn"+(item.favourite?" warn":"")} onClick={()=>{onToggleFav();onClose();}}>
+            <Ic d={I.star} size={22} color={item.favourite?"#f59e0b":"var(--mu)"} style={item.favourite?{fill:"#f59e0b"}:{}}/>
+            {item.favourite?"Unfav":"Favourite"}
+          </div>
+          <div className={"ctx-btn"+(item.archived?" accent":"")} onClick={()=>{onToggleArchive();onClose();}}>
+            <Ic d={I.archive} size={22} color={item.archived?"var(--ac2)":"var(--mu)"}/>
+            {item.archived?"Unarchive":"Archive"}
+          </div>
+          <div className="ctx-btn danger" onClick={()=>{onDelete();onClose();}}>
+            <Ic d={I.trash} size={22} color="var(--red)"/>Delete
+          </div>
+        </div>
+        <button className="btn btn-g" style={{marginTop:14}} onClick={onClose}>Cancel</button>
       </div>
     </div>
   );
@@ -1416,8 +1577,10 @@ export default function App() {
   const [editing,   setEditing]   = useState(null);
   const [adding,    setAdding]    = useState(false);
   const [toast,     setToast]     = useState(null);
-  const [recentIds, setRecentIds] = useState([]);
-  const lockTimer = useRef();
+  const [recentIds,  setRecentIds]  = useState([]);
+  const [ctxItem,    setCtxItem]    = useState(null); // long-press context menu
+  const [showArchive,setShowArchive]= useState(false); // show archived tab
+  const lockTimer  = useRef();
   const toastTimer = useRef();
 
   const dark = settings.dark !== false;
@@ -1487,6 +1650,16 @@ export default function App() {
     try { await persistAll(items); setTab("vault"); showToast(`Imported ${items.length} entries!`); }
     catch(e) { showToast("Import failed.","error"); }
   }
+  async function handleToggleFav(item) {
+    const updated = {...item, favourite:!item.favourite, updatedAt:Date.now()};
+    try { await persistSave(updated, item.password); showToast(updated.favourite?"Added to favourites ⭐":"Removed from favourites"); }
+    catch(e) { showToast("Failed to update.","error"); }
+  }
+  async function handleToggleArchive(item) {
+    const updated = {...item, archived:!item.archived, updatedAt:Date.now()};
+    try { await persistSave(updated, item.password); showToast(updated.archived?"Entry archived":"Entry unarchived"); }
+    catch(e) { showToast("Failed to update.","error"); }
+  }
   function handleLogout() {
     clearTimeout(lockTimer.current);
     setKey(null); setMasterPw(""); setVault([]); setDetail(null); setEditing(null); setAdding(false); setTab("vault"); setLocked(false);
@@ -1494,6 +1667,9 @@ export default function App() {
 
   // Filtering + sorting
   let filtered = vault.filter(v => {
+    // archived items only show in archive tab
+    if (showArchive) return !!v.archived;
+    if (v.archived) return false;
     if (showFavs && !v.favourite) return false;
     if (catFilt !== "all" && v.category !== catFilt) return false;
     const q = search.toLowerCase();
@@ -1518,8 +1694,9 @@ export default function App() {
         if(items.length) acc[c.id]=items; return acc;
       },{});
 
-  const recentItems = recentIds.map(id=>vault.find(v=>v.id===id)).filter(Boolean);
-  const auditIssues = key ? auditVault(vault) : [];
+  const recentItems  = recentIds.map(id=>vault.find(v=>v.id===id)).filter(Boolean);
+  const auditIssues  = key ? auditVault(vault) : [];
+  const archivedCount = vault.filter(v=>v.archived).length;
 
   // ── Loading ──
   if (loading) return (
@@ -1583,7 +1760,11 @@ export default function App() {
                   <div style={{position:"absolute",top:4,right:4,width:7,height:7,background:"var(--red)",borderRadius:"50%"}}/>
                 </button>
               )}
-              <button className={"ibtn"+(showFavs?" active":"")} onClick={()=>setShowFavs(v=>!v)} title="Favourites">
+              <button className={"ibtn"+(showArchive?" active":"")} onClick={()=>{setShowArchive(v=>!v);setShowFavs(false);}} title="Archive" style={{position:"relative"}}>
+                <Ic d={I.archive} size={17} color={showArchive?"var(--ac2)":"currentColor"}/>
+                {archivedCount>0 && !showArchive && <div style={{position:"absolute",top:3,right:3,width:7,height:7,background:"var(--mu)",borderRadius:"50%"}}/>}
+              </button>
+              <button className={"ibtn"+(showFavs?" active":"")} onClick={()=>{setShowFavs(v=>!v);setShowArchive(false);}} title="Favourites">
                 <Ic d={I.star} size={17} color={showFavs?"#f59e0b":"currentColor"} style={showFavs?{fill:"#f59e0b"}:{}}/>
               </button>
               <button className="ibtn" onClick={()=>setSortBy(s=>s==="name"?"updated":s==="updated"?"fav":"name")} title="Sort">
@@ -1615,15 +1796,20 @@ export default function App() {
           {recentItems.length>0 && !search && catFilt==="all" && !showFavs && (
             <div>
               <div className="slbl"><Ic d={I.history} size={12}/>Recently Used</div>
-              {recentItems.map(item=><VaultItem key={item.id} item={item} onClick={()=>setDetail(item)}/>)}
+              {recentItems.map(item=><VaultItem key={item.id} item={item} onClick={()=>setDetail(item)} onLongPress={()=>setCtxItem(item)}/>)}
             </div>
           )}
 
+          {showArchive && (
+            <div style={{background:"rgba(124,58,237,.08)",border:"1px solid rgba(124,58,237,.18)",borderRadius:"var(--rs)",padding:"12px 14px",marginBottom:12,fontSize:13,color:"var(--mu)"}}>
+              📦 Archived entries are hidden from your main vault. Long-press any entry to unarchive it.
+            </div>
+          )}
           {filtered.length===0 ? (
             <div className="empty">
-              <Ic d={I.lock} size={48}/>
-              <div style={{fontWeight:600,fontSize:15}}>{search||showFavs?"Nothing found":"Your vault is empty"}</div>
-              <div style={{fontSize:13,marginTop:5,opacity:.7}}>{showFavs?"Star entries to see them here":"Tap + to add your first entry"}</div>
+              <Ic d={showArchive?I.archive:I.lock} size={48}/>
+              <div style={{fontWeight:600,fontSize:15}}>{showArchive?"Nothing archived yet":search||showFavs?"Nothing found":"Your vault is empty"}</div>
+              <div style={{fontSize:13,marginTop:5,opacity:.7}}>{showArchive?"Long-press an entry and tap Archive":showFavs?"Star entries to see them here":"Tap + to add your first entry"}</div>
             </div>
           ) : Object.entries(grouped).map(([gid,items])=>(
             <div key={gid}>
@@ -1631,7 +1817,10 @@ export default function App() {
                 {hasFolders ? <><Ic d={I.folder} size={12}/>{gid}</> : <><Ic d={catIcon(gid)} size={12}/>{catLabel(gid)}</>}
                 <span style={{marginLeft:"auto",color:"var(--mu)",fontWeight:400,fontSize:11,textTransform:"none",letterSpacing:0}}>{items.length}</span>
               </div>
-              {items.map(item=><VaultItem key={item.id} item={item} onClick={()=>{setDetail(item);setRecentIds(r=>[item.id,...r.filter(x=>x!==item.id)].slice(0,5));}}/>)}
+              {items.map(item=><VaultItem key={item.id} item={item}
+                onClick={()=>{setDetail(item);setRecentIds(r=>[item.id,...r.filter(x=>x!==item.id)].slice(0,5));}}
+                onLongPress={()=>setCtxItem(item)}
+              />)}
             </div>
           ))}
         </div>
@@ -1663,6 +1852,18 @@ export default function App() {
         <ItemForm initial={editing} onSave={handleSave} onClose={()=>{setAdding(false);setEditing(null);if(editing)setDetail(editing);}}/>
       )}
       {toast && <Toast msg={toast.msg} type={toast.type}/>}
+
+      {/* Long-press context menu */}
+      {ctxItem && (
+        <ContextMenu
+          item={ctxItem}
+          onClose={()=>setCtxItem(null)}
+          onDelete={()=>handleDelete(ctxItem.id)}
+          onToggleFav={()=>handleToggleFav(ctxItem)}
+          onToggleArchive={()=>handleToggleArchive(ctxItem)}
+          onEdit={()=>{setEditing(ctxItem);setDetail(null);}}
+        />
+      )}
     </div>
     </>
   );
