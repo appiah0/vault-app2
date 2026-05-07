@@ -13,7 +13,7 @@ A fully encrypted, offline-first password manager built as a Progressive Web App
 - **6-digit PIN lock** — set a quick PIN as a shortcut to unlock instead of typing your full password
 - **Biometric unlock** — use your fingerprint to unlock on supported devices
 - **Auto-lock** — vault automatically locks after a period of inactivity (15s, 30s, 1min, 5min, 10min, 30min, 1hr)
-- **Failed login lockout** — after 5 wrong attempts, the vault locks for a configurable duration (5min, 15min, 30min, or 1hr) to protect against brute force attacks. Toggle on/off in Settings
+- **Failed login lockout** — after 5 wrong attempts, the vault locks for a configurable duration (5min, 15min, 30min, 1hr, 6hrs, 12hrs, or 1Day) to protect against brute force attacks. Toggle on/off in Settings
 - **Password breach check** — checks passwords against the HaveIBeenPwned database using k-anonymity (your password is never sent)
 - **Password strength meter** — live visual indicator as you type
 
