@@ -176,20 +176,31 @@ async function checkBreach(password) {
 }
 
 // ─── TOTP ─────────────────────────────────────────────────────────────────────
+// Validate that a string is a valid Base32 TOTP secret
+// Real secrets only contain A-Z and 2-7, are at least 16 chars, and decode to >= 10 bytes
+function validateTOTPSecret(secret) {
+  const clean = secret.toUpperCase().replace(/\s/g,"").replace(/=/g,"");
+  if (clean.length < 16) return { valid:false, reason:"Secret too short (min 16 characters)" };
+  if (!/^[A-Z2-7]+$/.test(clean)) return { valid:false, reason:"Invalid characters — must be A-Z and 2-7 only" };
+  // Decode to check byte length
+  const base32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  const bytes = [];
+  let buf = 0, bits = 0;
+  for (const ch of clean) {
+    buf = (buf << 5) | base32.indexOf(ch); bits += 5;
+    if (bits >= 8) { bytes.push((buf >> (bits-8)) & 0xff); bits -= 8; }
+  }
+  if (bytes.length < 10) return { valid:false, reason:"Secret too short after decoding" };
+  return { valid:true, clean, bytes };
+}
+
 async function generateTOTP(secret) {
   try {
-    const base32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-    const clean  = secret.toUpperCase().replace(/\s/g,"").replace(/=/g,"");
-    const bytes  = [];
-    let buf = 0, bits = 0;
-    for (const ch of clean) {
-      const val = base32.indexOf(ch); if (val < 0) continue;
-      buf = (buf << 5) | val; bits += 5;
-      if (bits >= 8) { bytes.push((buf >> (bits-8)) & 0xff); bits -= 8; }
-    }
-    const keyBytes = new Uint8Array(bytes);
-    let counter     = Math.floor(Date.now() / 30000);
-    const msg       = new Uint8Array(8);
+    const result = validateTOTPSecret(secret);
+    if (!result.valid) return "------";
+    const keyBytes = new Uint8Array(result.bytes);
+    let counter = Math.floor(Date.now() / 30000);
+    const msg   = new Uint8Array(8);
     for (let i = 7; i >= 0; i--) { msg[i] = counter & 0xff; counter = Math.floor(counter / 256); }
     const cryptoKey = await crypto.subtle.importKey("raw", keyBytes, { name:"HMAC", hash:"SHA-1" }, false, ["sign"]);
     const sig    = new Uint8Array(await crypto.subtle.sign("HMAC", cryptoKey, msg));
@@ -800,11 +811,28 @@ function AuthScreen({ onAuth, settings }) {
 }
 
 // ─── TOTP Component ───────────────────────────────────────────────────────────
+// Inline hint shown in the form while editing
+function TotpHint({ secret }) {
+  if (!secret) return (
+    <div style={{fontSize:11,color:"var(--mu)",marginTop:5,lineHeight:1.5}}>
+      Get this from your website 2FA setup page. Look for "enter code manually" or "show key". It looks like: JBSWY3DPEHPK3PXP
+    </div>
+  );
+  const r = validateTOTPSecret(secret);
+  if (r.valid) return <div style={{fontSize:12,color:"var(--grn)",marginTop:5,fontWeight:600}}>✓ Valid Base32 secret</div>;
+  return <div style={{fontSize:12,color:"var(--red)",marginTop:5}}>{r.reason}</div>;
+}
+
 function TotpDisplay({ secret }) {
-  const [code, setCode]     = useState("------");
-  const [secs, setSecs]     = useState(30);
+  const [code,    setCode]    = useState("------");
+  const [secs,    setSecs]    = useState(30);
+  const [invalid, setInvalid] = useState(null); // validation error message
 
   useEffect(() => {
+    // Validate before starting the interval
+    const check = validateTOTPSecret(secret);
+    if (!check.valid) { setInvalid(check.reason); setCode("------"); return; }
+    setInvalid(null);
     let alive = true;
     async function tick() {
       const c = await generateTOTP(secret);
@@ -815,6 +843,16 @@ function TotpDisplay({ secret }) {
     const id = setInterval(tick, 1000);
     return () => { alive=false; clearInterval(id); };
   }, [secret]);
+
+  if (invalid) {
+    return (
+      <div className="totp-box" style={{background:"rgba(239,68,68,.08)",borderColor:"rgba(239,68,68,.2)"}}>
+        <div style={{fontSize:11,color:"var(--red)",fontWeight:600,letterSpacing:1,textTransform:"uppercase",marginBottom:6}}>⚠ Invalid 2FA Secret</div>
+        <div style={{fontSize:13,color:"var(--mu)",lineHeight:1.5}}>{invalid}</div>
+        <div style={{fontSize:12,color:"var(--mu)",marginTop:8,opacity:.8}}>Enter the Base32 key shown by your website when setting up 2FA (e.g. JBSWY3DPEHPK3PXP)</div>
+      </div>
+    );
+  }
 
   const pct = (secs/30)*100;
   const col  = secs <= 5 ? "var(--red)" : secs <= 10 ? "var(--ylw)" : "var(--ac2)";
@@ -1110,10 +1148,13 @@ function SettingsScreen({ vault, settings, onSettings, onImport, toast, onLogout
     { v:3600, label:"1 hour" },
   ];
   const lockoutOptions = [
-    { v:5,   label:"5 minutes" },
-    { v:15,  label:"15 minutes" },
-    { v:30,  label:"30 minutes" },
-    { v:60,  label:"1 hour" },
+    { v:5,    label:"5 minutes" },
+    { v:15,   label:"15 minutes" },
+    { v:30,   label:"30 minutes" },
+    { v:60,   label:"1 hour" },
+    { v:360,  label:"6 hours" },
+    { v:720,  label:"12 hours" },
+    { v:1440, label:"1 day" },
   ];
 
   return (
@@ -1305,7 +1346,9 @@ function ItemForm({ initial, onSave, onClose }) {
               <div className="ig"><label className="lbl">Website URL</label>
                 <input className="inp" value={form.url} onChange={e=>set("url",e.target.value)} placeholder="https://example.com"/></div>
               <div className="ig"><label className="lbl">2FA Secret (TOTP)</label>
-                <input className="inp" value={form.totpSecret||""} onChange={e=>set("totpSecret",e.target.value)} placeholder="Base32 secret from QR code"/></div>
+                <input className="inp" value={form.totpSecret||""} onChange={e=>set("totpSecret",e.target.value)} placeholder="e.g. JBSWY3DPEHPK3PXP"/>
+                <TotpHint secret={form.totpSecret}/>
+              </div>
               <div className="ig"><label className="lbl">Password Expires</label>
                 <input className="inp" type="date" value={form.expiresAt?new Date(form.expiresAt).toISOString().slice(0,10):""}
                   onChange={e=>set("expiresAt",e.target.value?new Date(e.target.value).getTime():null)}/></div>
@@ -1609,6 +1652,29 @@ export default function App() {
     openDB().then(db=>{db.close();setLoading(false);}).catch(()=>setLoading(false));
   }, []);
 
+  // ── Browser back button support ───────────────────────────────────────────
+  // Push a history entry whenever a "layer" opens so back closes it instead
+  // of exiting the app. Layer priority: ctxItem > adding/editing > detail > settings/audit > vault
+  useEffect(() => {
+    function handlePopState() {
+      // Close the topmost open layer
+      if (ctxItem)            { setCtxItem(null);  history.pushState(null,"",""); return; }
+      if (adding)             { setAdding(false);   history.pushState(null,"",""); return; }
+      if (editing)            { setEditing(null);   history.pushState(null,"",""); return; }
+      if (detail)             { setDetail(null);    history.pushState(null,"",""); return; }
+      if (tab !== "vault")    { setTab("vault");    history.pushState(null,"",""); return; }
+      // Nothing open — let the app stay open (push again so next back still works)
+      history.pushState(null,"","");
+    }
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, [ctxItem, adding, editing, detail, tab]);
+
+  // Push initial history entry when vault unlocks so first back is intercepted
+  useEffect(() => {
+    if (key) history.pushState(null,"","");
+  }, [key]);
+
   function showToast(msg, type="ok") {
     clearTimeout(toastTimer.current);
     setToast({msg,type});
@@ -1868,3 +1934,4 @@ export default function App() {
     </>
   );
 }
+
